@@ -8,12 +8,15 @@
 #define TOL 1e-5
 #define ITER_LIMIT 1000
 #define NUM_THREADS_PER_BLOCK 32
+#define TILE_SIZE 16
 
 __managed__ float diff = 0.0;
 __managed__ int nthreads, n;
 __device__ int count = 0;
 __managed__ int iterations = 0;
 __device__ volatile int barrier_flag = 0;
+
+#ifdef CUDA_RANDOM
 
 __global__ void init(unsigned int seed, curandState_t* states) {
     curand_init(seed, blockIdx.x, 0, &states[blockIdx.x]);
@@ -28,13 +31,29 @@ __global__ void init_kernel(float*A, int span, curandState_t* states) {
     }
 }
 
+#endif
+
+#ifdef FIX
+__global__ void init_sample_kernel(float*A, int span){
+    int id  = threadIdx.x + blockIdx.x*blockDim.x;
+    int val = ((n+2)*(n+2) < span*(id+1)) ? (n+2)*(n+2) : span*(id+1);
+    for (int i = span*id; i < val; i++) {
+        // A[i] = (curand(&states[i])%100) / 100.0;
+        A[i] = float(i%100)/100;
+    }
+
+}
+#endif
+
 __global__ void gauss_seidel_kernel(float*A, int span){
     int id = threadIdx.x + blockIdx.x*blockDim.x;
     //int val = span*(id+1);
     int done = 0;
     float local_diff, temp;
+    int j, index;
     int local_sense = 0, last_count;
     __shared__ float local_area2[NUM_THREADS_PER_BLOCK/32];
+    __shared__ float  as[NUM_THREADS_PER_BLOCK+2][TILE_SIZE+2];
 
 
     while(!done){
@@ -57,13 +76,54 @@ __global__ void gauss_seidel_kernel(float*A, int span){
         
         for(int i = id; i < n; i+= span){
 
-            for(int j=0; j<n; j++){
+            for(int tile_num = 0; tile_num < n; tile_num+=TILE_SIZE){
 
-                int index = (n+2)*(i+1)+j+1;
-                temp = A[index];
-                A[index] = 0.2*(A[index]+A[index-1]+A[index+1]+A[index+n+2]+A[index-n-2]);
-                local_diff += fabs(A[index]-temp);
+                j = tile_num-1;
+                index = (n+2)*(i+1)+j+1;
+                for(int tile_off=-1; tile_off<=TILE_SIZE; tile_off++){
+                    as[threadIdx.x+1][tile_off+1] = A[index];
+                    index++;
+                }
+
+                if(threadIdx.x == 0){
+
+                    j = tile_num -1;
+                    index = (n+2)*i+j+1;
+                   
+                    for(int tile_off= -1; tile_off<=TILE_SIZE; tile_off++){
+                        as[0][tile_off+1] = A[index];
+                        index++;
+                    }
+                }
+
+                if(threadIdx.x == NUM_THREADS_PER_BLOCK-1){
+                  
+                  j = tile_num-1;
+                  index = (n+2)*(i+2)+j+1;
+                    for(int tile_off= -1; tile_off<=TILE_SIZE; tile_off++){
+                          
+                        as[NUM_THREADS_PER_BLOCK+1][tile_off+1] = A[index];
+                        index++;
+                    }
+                }
+                __syncthreads();
+
+               j = tile_num;
+               index = (n+2)*(i+1)+j+1;
+
+                for(int tile_off= 0; tile_off<TILE_SIZE; tile_off++){
+                   
+                    temp = as[threadIdx.x+1][tile_off+1];
+                    A[index] = 0.2*(as[threadIdx.x+1][tile_off+1]+as[threadIdx.x+1][tile_off]+as[threadIdx.x][tile_off+1]+as[threadIdx.x+2][tile_off+1]+as[threadIdx.x+1][tile_off+2]);
+                    local_diff += fabs(A[index]-temp);
+                    index++;
+                }
+
+                __syncthreads();
+
+
             }
+
 
         }
 
@@ -137,7 +197,22 @@ int main(int argc, char*argv[]){
     int device = -1;
     cudaGetDevice(&device);
 	cudaMemAdvise(A, sizeof(float)*(n+2)*(n+2), cudaMemAdviseSetPreferredLocation, device);
+    
+    unsigned long span = (n+2)*(n+2)/nthreads;
+    if (span*nthreads < (n+2)*(n+2)){
+        span++;
+    }
 
+    #ifdef FIX
+    init_sample_kernel<<< nthreads/NUM_THREADS_PER_BLOCK, NUM_THREADS_PER_BLOCK >>>(A,span);
+    cudaDeviceSynchronize();
+    err = cudaGetLastError();
+    if ( err != cudaSuccess ) {
+      		printf("CUDA Error2: %s\n", cudaGetErrorString(err));
+      		exit(-1);
+   	}
+    #endif
+    #ifdef CUDA_RANDOM
     curandState_t* states;
 
     cudaMalloc((void**) &states, (n+2) * (n+2) * sizeof(curandState_t));
@@ -156,10 +231,7 @@ int main(int argc, char*argv[]){
       		exit(-1);
     }
 
-    unsigned long span = (n+2)*(n+2)/nthreads;
-    if (span*nthreads < (n+2)*(n+2)){
-        span++;
-    }
+    
     init_kernel<<< nthreads/NUM_THREADS_PER_BLOCK, NUM_THREADS_PER_BLOCK >>>(A, span, states);
     err = cudaGetLastError();
     if ( err != cudaSuccess ) {
@@ -172,6 +244,7 @@ int main(int argc, char*argv[]){
       		printf("CUDA Error2: %s\n", cudaGetErrorString(err));
       		exit(-1);
    	}
+    #endif
     printf("Matrix initalization done!\n");
 
     gettimeofday(&tv0, &tz0);
