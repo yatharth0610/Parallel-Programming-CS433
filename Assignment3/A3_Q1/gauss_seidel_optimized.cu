@@ -95,9 +95,9 @@ __global__ void gauss_seidel_kernel(float*A, int span){
         }
         __syncthreads();
 
-        if((threadIdx.x/(NUM_THREADS_PER_BLOCK/32)) == 0){
+        if((threadIdx.x/(NUM_THREADS_PER_BLOCK/warpSize)) == 0){
             local_diff = local_area2[threadIdx.x];
-            for(int i=NUM_THREADS_PER_BLOCK/64; i>0; i=i/2){
+            for(int i=NUM_THREADS_PER_BLOCK/(2*warpSize); i>0; i=i/2){
                 local_diff+= __shfl_down_sync(mask, local_diff, i);
             }
             if(threadIdx.x ==0){
@@ -211,7 +211,9 @@ int main(int argc, char*argv[]){
 
     gettimeofday(&tv0, &tz0);
     printf("Calling kernel!\n");
+
     gauss_seidel_kernel<<< nthreads/NUM_THREADS_PER_BLOCK, NUM_THREADS_PER_BLOCK >>>(A, n/nthreads);
+
     err = cudaGetLastError();
     if ( err != cudaSuccess ) {
       		printf("CUDA Error3: %s\n", cudaGetErrorString(err));

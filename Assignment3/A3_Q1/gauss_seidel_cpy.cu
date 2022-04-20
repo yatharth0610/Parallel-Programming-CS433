@@ -1,14 +1,13 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <cuda.h>
+#include<stdio.h>
+#include<stdlib.h>
+#include<cuda.h>
 #include <curand.h>
 #include <curand_kernel.h>
-#include <sys/time.h>
+#include<sys/time.h>
 
 #define TOL 1e-5
 #define ITER_LIMIT 1000
 #define NUM_THREADS_PER_BLOCK 32
-#define TILE_SIZE 16
 
 __managed__ float diff = 0.0;
 __managed__ int nthreads, n;
@@ -17,7 +16,6 @@ __managed__ int iterations = 0;
 __device__ volatile int barrier_flag = 0;
 
 #ifdef CUDA_RANDOM
-
 __global__ void init(unsigned int seed, curandState_t* states) {
     curand_init(seed, blockIdx.x, 0, &states[blockIdx.x]);
 }
@@ -30,7 +28,6 @@ __global__ void init_kernel(float*A, int span, curandState_t* states) {
         // A[i] = i / (n+2);
     }
 }
-
 #endif
 
 #ifdef FIX
@@ -45,15 +42,103 @@ __global__ void init_sample_kernel(float*A, int span){
 }
 #endif
 
+
+// call with A and nthreads
+__global__ void gauss_seidel_kernel_general(float*A, int span){
+    int id = threadIdx.x + blockIdx.x*blockDim.x;
+    int val =  n*n;
+    int done = 0, row, col;
+    float local_diff, temp;
+    int local_sense = 0, last_count, index, iterations = 0;
+    __shared__ float local_area2[NUM_THREADS_PER_BLOCK/32];
+
+    while(!done){
+        // printf("Started function!\n");
+        if(id == 0){
+            diff = 0.0;
+        }
+        local_diff = 0.0;
+        
+        /************ Barrier ************/
+        local_sense = (local_sense ? 0 : 1);
+        __syncthreads();
+        last_count = atomicAdd(&count, 1);
+
+        if (last_count == nthreads - 1) {
+            count = 0;
+            barrier_flag = local_sense;
+        }
+        while (barrier_flag != local_sense);
+        
+        for(int i = id; i < val; i+=span){
+            row = i/(n);
+            col = i-row*(n);
+
+            index = (row+1)*(n+2)+(col+1);
+
+            temp = A[index];
+            A[index] = 0.2*(A[index+1]+A[index-1]+A[index+n+2]+A[index-n-2]+A[index]);
+            local_diff += fabs(A[index]-temp);
+        }
+
+        unsigned mask = 0xffffffff;
+        for (int i = warpSize/2; i > 0; i = i/2) {
+            local_diff += __shfl_down_sync(mask, local_diff, i);
+        }
+
+        if(threadIdx.x % warpSize == 0) {
+            local_area2[threadIdx.x/warpSize] = local_diff;
+        }
+        __syncthreads();
+
+        if((threadIdx.x/(NUM_THREADS_PER_BLOCK/32)) == 0){
+            local_diff = local_area2[threadIdx.x];
+            for(int i=NUM_THREADS_PER_BLOCK/64; i>0; i=i/2){
+                local_diff+= __shfl_down_sync(mask, local_diff, i);
+            }
+            if(threadIdx.x ==0){
+                atomicAdd(&diff, local_diff);
+            }
+
+        }
+        /************ Barrier ************/
+        local_sense = (local_sense ? 0 : 1);
+        __syncthreads();
+        last_count = atomicAdd(&count, 1);
+        if (last_count == nthreads - 1) {
+            count = 0;
+            barrier_flag = local_sense;
+        }
+        while (barrier_flag != local_sense);
+
+        iterations++;
+        if ((diff/(n*n)< TOL) || (iterations == ITER_LIMIT)){
+            done = 1;
+        }
+
+        /************ Barrier ************/
+        local_sense = (local_sense ? 0 : 1);
+        __syncthreads();
+        last_count = atomicAdd(&count, 1);
+        if (last_count == nthreads - 1) {
+            count = 0;
+            barrier_flag = local_sense;
+        }
+        while (barrier_flag != local_sense);
+    }
+    if(id == 0){
+        printf("Iterations : %d\n", iterations);
+    }
+}
+
+
 __global__ void gauss_seidel_kernel(float*A, int span){
     int id = threadIdx.x + blockIdx.x*blockDim.x;
-    //int val = span*(id+1);
-    int done = 0;
+    int val = ((n+2)*(n+2) < span*(id+1)) ? (n+2)*(n+2) : span*(id+1);
+    int done = 0, row, col;
     float local_diff, temp;
-    int j, index;
     int local_sense = 0, last_count;
     __shared__ float local_area2[NUM_THREADS_PER_BLOCK/32];
-    __shared__ float  as[NUM_THREADS_PER_BLOCK+2][TILE_SIZE+2];
 
 
     while(!done){
@@ -74,52 +159,14 @@ __global__ void gauss_seidel_kernel(float*A, int span){
         }
         while (barrier_flag != local_sense);
         
-        for(int i = id; i < n; i+= span){
+        for(int i = span*id; i < val; i++){
+            row = i/(n+2);
+            col = i-row*(n+2);
 
-            for(int tile_num = 0; tile_num < n; tile_num+=TILE_SIZE){
-
-                j = tile_num-1;
-                index = (n+2)*(i+1)+j+1;
-                for(int tile_off=-1; tile_off<=TILE_SIZE; tile_off++){
-                    as[threadIdx.x+1][tile_off+1] = A[index];
-                    index++;
-                }
-
-                if(threadIdx.x == 0){
-
-                    j = tile_num -1;
-                    index = (n+2)*i+j+1;
-                   
-                    for(int tile_off= -1; tile_off<=TILE_SIZE; tile_off++){
-                        as[0][tile_off+1] = A[index];
-                        index++;
-                    }
-                }
-
-                if(threadIdx.x == NUM_THREADS_PER_BLOCK-1){
-                  
-                  j = tile_num-1;
-                  index = (n+2)*(i+2)+j+1;
-                    for(int tile_off= -1; tile_off<=TILE_SIZE; tile_off++){
-                          
-                        as[NUM_THREADS_PER_BLOCK+1][tile_off+1] = A[index];
-                        index++;
-                    }
-                }
-                __syncthreads();
-
-               j = tile_num;
-               index = (n+2)*(i+1)+j+1;
-
-                for(int tile_off= 0; tile_off<TILE_SIZE; tile_off++){
-                   
-                    temp = as[threadIdx.x+1][tile_off+1];
-                    A[index] = 0.2*(as[threadIdx.x+1][tile_off+1]+as[threadIdx.x+1][tile_off]+as[threadIdx.x][tile_off+1]+as[threadIdx.x+2][tile_off+1]+as[threadIdx.x+1][tile_off+2]);
-                    local_diff += fabs(A[index]-temp);
-                    index++;
-                }
-
-                __syncthreads();
+            if (row != 0 && row != n+1 && col != 0 and col != n+1) {
+                temp = A[i];
+                A[i] = 0.2*(A[i] + A[i-1] + A[i+1] + A[i + n + 2] + A[i - n - 2]);
+                local_diff += fabs(A[i] - temp); 
             }
         }
 
@@ -193,7 +240,7 @@ int main(int argc, char*argv[]){
     int device = -1;
     cudaGetDevice(&device);
 	cudaMemAdvise(A, sizeof(float)*(n+2)*(n+2), cudaMemAdviseSetPreferredLocation, device);
-    
+
     unsigned long span = (n+2)*(n+2)/nthreads;
     if (span*nthreads < (n+2)*(n+2)){
         span++;
@@ -208,7 +255,9 @@ int main(int argc, char*argv[]){
       		exit(-1);
    	}
     #endif
+
     #ifdef CUDA_RANDOM
+
     curandState_t* states;
 
     cudaMalloc((void**) &states, (n+2) * (n+2) * sizeof(curandState_t));
@@ -239,13 +288,14 @@ int main(int argc, char*argv[]){
     if ( err != cudaSuccess ) {
       		printf("CUDA Error2: %s\n", cudaGetErrorString(err));
       		exit(-1);
+
    	}
     #endif
     printf("Matrix initalization done!\n");
 
     gettimeofday(&tv0, &tz0);
     printf("Calling kernel!\n");
-    gauss_seidel_kernel<<< nthreads/NUM_THREADS_PER_BLOCK, NUM_THREADS_PER_BLOCK >>>(A, nthreads);
+    gauss_seidel_kernel<<< nthreads/NUM_THREADS_PER_BLOCK, NUM_THREADS_PER_BLOCK >>>(A, span);
     err = cudaGetLastError();
     if ( err != cudaSuccess ) {
       		printf("CUDA Error3: %s\n", cudaGetErrorString(err));
